@@ -1,0 +1,48 @@
+# Compiled class files & Build folders
+*.class
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+target/
+out/
+
+# Gradle
+.gradle/
+gradle-app.setting
+!gradle-wrapper.jar
+!gradle-wrapper.properties
+
+# Environment Variables & Secrets (Proteção Crítica)
+.env
+.env.*
+*.env
+!.env.example
+application-local.yml
+application-local.properties
+application-secret.yml
+application-prod.yml
+
+# IntelliJ IDEA (Ignora configurações locais que contêm suas env vars salvas na IDE)
+.idea/
+*.iws
+*.iml
+*.ipr
+/shelf/
+/workspace.xml
+
+# VS Code & Eclipse
+.vscode/
+.settings/
+.classpath
+.project
+
+# Logs & Java Crash Dumps
+*.log
+logs/
+hs_err_pid*
+replay_pid*
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
+Desktop.ini

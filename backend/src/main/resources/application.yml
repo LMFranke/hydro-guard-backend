@@ -1,0 +1,24 @@
+spring:
+  datasource:
+    url: ${DATABASE_URL}
+    username: ${DATABASE_USER}
+    password: ${DATABASE_PASSWORD}
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+api:
+  security:
+    token:
+      secret: ${JWT_SECRET:hydroguard-dev-secret-key}
+  ana:
+    base-url: https://www.ana.gov.br/hidrowebservice/EstacoesTelemetricas
+    identifier: ${ANA_IDENTIFIER}
+    password: ${ANA_PASSWORD}
