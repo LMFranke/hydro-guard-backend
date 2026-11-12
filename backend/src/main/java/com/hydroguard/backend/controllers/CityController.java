@@ -3,8 +3,11 @@ package com.hydroguard.backend.controllers;
 import com.hydroguard.backend.models.City;
 import com.hydroguard.backend.repositories.CityRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
 
 @RestController
 @RequestMapping("/api/v1/tenant")
@@ -13,6 +16,11 @@ import org.springframework.web.bind.annotation.*;
 public class CityController {
 
     private final CityRepository cityRepository;
+
+    @GetMapping
+    public ResponseEntity<List<City>> getAllCities() {
+        return ResponseEntity.ok(cityRepository.findAll(Sort.by(Sort.Direction.ASC, "name")));
+    }
 
     @GetMapping("/{slug}")
     public ResponseEntity<City> getCityBySlug(@PathVariable String slug) {

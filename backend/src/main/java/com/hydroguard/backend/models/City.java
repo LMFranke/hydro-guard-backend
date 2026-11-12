@@ -1,5 +1,6 @@
 package com.hydroguard.backend.models;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -54,6 +55,7 @@ public class City {
     @Column(name = "theme_color")
     private String themeColor;
 
+    @JsonIgnore
     @OneToMany(mappedBy = "city", cascade = CascadeType.ALL, fetch = FetchType.LAZY)
     private List<MonitoringStation> stations;
 }

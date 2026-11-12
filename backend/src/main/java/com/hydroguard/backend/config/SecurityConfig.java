@@ -37,6 +37,7 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET, "/api/v1/telemetry/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/alerts/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/risk-zones/**").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/v1/system/**").permitAll()
                         .anyRequest().authenticated()
                 )
                 .addFilterBefore(securityFilter, UsernamePasswordAuthenticationFilter.class)
