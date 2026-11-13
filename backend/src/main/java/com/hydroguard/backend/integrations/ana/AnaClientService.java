@@ -39,9 +39,12 @@ import java.util.concurrent.locks.ReentrantLock;
 @Service
 public class AnaClientService {
 
-    private static final int TARGET_FLUVIOMETRIC_PER_CITY = 8;
-    private static final int TARGET_PLUVIOMETRIC_PER_CITY = 4;
-    private static final double BASIN_SEARCH_RADIUS_KM = 30.0;
+    // Seleciona um pool maior de candidatas reais para que o TelemetryService possa pular
+    // sensores que não transmitiram hoje e ainda assim entregar 8 Fluv + 4 Pluv com dados reais
+    private static final int CANDIDATE_FLUVIOMETRIC_LIMIT = 18;
+    private static final int CANDIDATE_PLUVIOMETRIC_LIMIT = 8;
+    private static final double BASIN_SEARCH_RADIUS_KM = 35.0;
+    private static final long MIN_REQUEST_INTERVAL_MS = 200;
 
     private final RestClient restClient;
     private final String baseUrl;
@@ -51,6 +54,9 @@ public class AnaClientService {
     private volatile String cachedToken;
     private volatile Instant tokenExpiration;
     private final ReentrantLock authLock = new ReentrantLock();
+    private final ReentrantLock inventoryLock = new ReentrantLock();
+    private final ReentrantLock paceLock = new ReentrantLock();
+    private volatile long lastRequestTimestampMs = 0;
 
     private volatile Instant circuitOpenUntil = Instant.EPOCH;
 
@@ -74,8 +80,9 @@ public class AnaClientService {
         this.password = password;
 
         SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
-        requestFactory.setConnectTimeout(Duration.ofSeconds(5));
-        requestFactory.setReadTimeout(Duration.ofSeconds(6));
+        requestFactory.setConnectTimeout(Duration.ofSeconds(8));
+        // Timeout de leitura de 20s porque o catálogo de estações (/HidroInventarioEstacoes/v1) é extenso
+        requestFactory.setReadTimeout(Duration.ofSeconds(20));
 
         this.restClient = RestClient.builder()
                 .baseUrl(baseUrl)
@@ -87,6 +94,26 @@ public class AnaClientService {
 
     public boolean isCircuitOpen() {
         return Instant.now().isBefore(circuitOpenUntil);
+    }
+
+    /**
+     * Garante que chamadas concorrentes (ex: Cache Warmer + Usuário clicando no Front-end)
+     * respeitem um intervalo mínimo entre requisições para nunca tomar bloqueio de IP na ANA.
+     */
+    private void enforceRequestPacing() {
+        paceLock.lock();
+        try {
+            long now = System.currentTimeMillis();
+            long elapsed = now - lastRequestTimestampMs;
+            if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+                Thread.sleep(MIN_REQUEST_INTERVAL_MS - elapsed);
+            }
+            lastRequestTimestampMs = System.currentTimeMillis();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } finally {
+            paceLock.unlock();
+        }
     }
 
     public String getValidToken() {
@@ -108,6 +135,7 @@ public class AnaClientService {
                 throw new RuntimeException("ANA API Circuit Breaker is OPEN (Fast-Fail)");
             }
 
+            enforceRequestPacing();
             long startNanos = System.nanoTime();
             AnaAuthResponseDTO response = restClient.get()
                     .uri("/OAUth/v1")
@@ -144,6 +172,7 @@ public class AnaClientService {
             throw new RuntimeException("ANA Circuit Breaker OPEN - skipping station " + stationCode);
         }
 
+        enforceRequestPacing();
         long startNanos = System.nanoTime();
         try {
             String token = getValidToken();
@@ -173,40 +202,42 @@ public class AnaClientService {
     }
 
     /**
-     * Descobre até 12 estações (8 Fluviométricas + 4 Pluviométricas) combinando:
-     * 1. Estações localizadas dentro do próprio município;
-     * 2. Estações da bacia hidrográfica num raio de 30 km (rios afluentes/montante).
+     * Pré-carrega o inventário estadual da ANA antes de sincronizar os municípios.
+     */
+    public void preloadStateInventory(String stateUf) {
+        getOperatingTelemetricStationsByState(stateUf);
+    }
+
+    /**
+     * Descobre as estações telemétricas reais da ANA para o município e bacia (raio de 35 km),
+     * ordenadas por distância geográfica a partir do centro da cidade.
      */
     public List<MonitoringStation> discoverStationsForCity(City city) {
-        if (isCircuitOpen()) {
-            return Collections.emptyList();
-        }
-
         String stateUf = (city.getState() != null && !city.getState().isBlank())
                 ? city.getState().trim().toUpperCase()
                 : "SC";
 
-        List<AnaStationInventoryItemDTO> stateStations = getOperatingStationsByState(stateUf);
+        List<AnaStationInventoryItemDTO> stateStations = getOperatingTelemetricStationsByState(stateUf);
         if (stateStations.isEmpty()) {
             return Collections.emptyList();
         }
 
         String normalizedCityName = normalizeText(city.getName());
 
-        Comparator<AnaStationInventoryItemDTO> recencyComparator = Comparator
-                .comparing((AnaStationInventoryItemDTO item) -> "1".equals(item.isTelemetric()) ? 1 : 0, Comparator.reverseOrder())
-                .thenComparing(item -> item.lastUpdate() != null ? item.lastUpdate() : "", Comparator.reverseOrder());
-
+        // 1. Estações telemétricas registradas dentro do próprio município
         List<AnaStationInventoryItemDTO> exactCityMatches = stateStations.stream()
                 .filter(item -> normalizeText(item.municipalityName()).equals(normalizedCityName))
-                .sorted(recencyComparator)
+                .sorted(Comparator.comparing(
+                        (AnaStationInventoryItemDTO item) -> item.lastUpdate() != null ? item.lastUpdate() : "",
+                        Comparator.reverseOrder()
+                ))
                 .toList();
 
+        // 2. Estações telemétricas na bacia hidrográfica num raio de 35 km (ordenadas pela menor distância)
         List<AnaStationInventoryItemDTO> radiusMatches = Collections.emptyList();
         if (city.getMapLat() != null && city.getMapLng() != null) {
             radiusMatches = stateStations.stream()
                     .filter(item -> !normalizeText(item.municipalityName()).equals(normalizedCityName))
-                    .filter(item -> "1".equals(item.isTelemetric()))
                     .filter(item -> {
                         Double lat = parseCoord(item.latitude());
                         Double lng = parseCoord(item.longitude());
@@ -242,88 +273,111 @@ public class AnaClientService {
                 continue;
             }
 
-            if (isFluviometric && fluviometricCount < TARGET_FLUVIOMETRIC_PER_CITY) {
+            if (isFluviometric && fluviometricCount < CANDIDATE_FLUVIOMETRIC_LIMIT) {
                 selectedStations.put(code, mapInventoryItemToStation(item, city, normalizedCityName));
                 seenNamesAndType.add(dedupNameKey);
                 fluviometricCount++;
-            } else if (!isFluviometric && pluviometricCount < TARGET_PLUVIOMETRIC_PER_CITY) {
+            } else if (!isFluviometric && pluviometricCount < CANDIDATE_PLUVIOMETRIC_LIMIT) {
                 selectedStations.put(code, mapInventoryItemToStation(item, city, normalizedCityName));
                 seenNamesAndType.add(dedupNameKey);
                 pluviometricCount++;
             }
 
-            if (fluviometricCount >= TARGET_FLUVIOMETRIC_PER_CITY && pluviometricCount >= TARGET_PLUVIOMETRIC_PER_CITY) {
+            if (fluviometricCount >= CANDIDATE_FLUVIOMETRIC_LIMIT && pluviometricCount >= CANDIDATE_PLUVIOMETRIC_LIMIT) {
                 break;
             }
         }
 
-        List<MonitoringStation> finalStations = applyCoordinateDeoverlapping(new ArrayList<>(selectedStations.values()));
+        List<MonitoringStation> finalCandidates = applyCoordinateDeoverlapping(new ArrayList<>(selectedStations.values()));
 
-        log.info("[ANA Discovery] Cidade '{}': {} estações selecionadas ({} Fluviométricas, {} Pluviométricas): {}",
-                city.getName(),
-                finalStations.size(),
-                fluviometricCount,
-                pluviometricCount,
-                finalStations.stream().map(s -> s.getStationCode() + " - " + s.getName()).toList());
+        log.info("[ANA Discovery] Cidade '{}': {} candidatas telemétricas reais encontradas no raio de {}km",
+                city.getName(), finalCandidates.size(), BASIN_SEARCH_RADIUS_KM);
 
-        return finalStations;
+        return finalCandidates;
     }
 
     public List<AnaStationInventoryItemDTO> discoverActiveItajaiStations() {
-        return getOperatingStationsByState("SC").stream()
+        return getOperatingTelemetricStationsByState("SC").stream()
                 .filter(item -> "83".equals(item.subBasinCode()))
-                .filter(item -> "1".equals(item.isTelemetric()))
                 .toList();
     }
 
-    private List<AnaStationInventoryItemDTO> getOperatingStationsByState(String stateUf) {
+    /**
+     * Consulta o endpoint oficial /HidroInventarioEstacoes/v1 da ANA com lock de exclusão mútua
+     * (garantindo que apenas 1 thread baixe o catálogo estadual) e filtra estritamente
+     * estações Telemétricas ("1") e Operando ("1").
+     */
+    private List<AnaStationInventoryItemDTO> getOperatingTelemetricStationsByState(String stateUf) {
         CachedStateInventory cached = stateInventoryCache.get(stateUf);
         if (cached != null && Instant.now().isBefore(cached.expiresAt())) {
             return cached.items();
         }
 
-        if (isCircuitOpen()) {
-            return cached != null ? cached.items() : Collections.emptyList();
-        }
-
+        inventoryLock.lock();
         try {
-            String token = getValidToken();
-            URI uri = UriComponentsBuilder.fromUriString(baseUrl + "/HidroInventarioEstacoes/v1")
-                    .queryParam("Unidade Federativa", stateUf)
-                    .queryParam("Código da Bacia", "8")
-                    .encode(StandardCharsets.UTF_8)
-                    .build()
-                    .toUri();
-
-            var response = restClient.get()
-                    .uri(uri)
-                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                    .retrieve()
-                    .body(AnaInventoryResponseDTO.class);
-
-            if (response == null || response.items() == null) {
-                return Collections.emptyList();
+            cached = stateInventoryCache.get(stateUf);
+            if (cached != null && Instant.now().isBefore(cached.expiresAt())) {
+                return cached.items();
             }
 
-            List<AnaStationInventoryItemDTO> activeStations = response.items().stream()
-                    .filter(item -> item.stationCode() != null && !item.stationCode().isBlank())
-                    .filter(item -> "1".equals(item.operating()))
-                    .filter(item -> item.telemetricEndDate() == null || item.telemetricEndDate().isBlank())
-                    .filter(item -> parseCoord(item.latitude()) != null && parseCoord(item.longitude()) != null)
-                    .toList();
+            for (int attempt = 1; attempt <= 2; attempt++) {
+                try {
+                    String token = getValidToken();
+                    enforceRequestPacing();
 
-            log.info("[ANA Inventory] Carregadas {} estações em operação (Fluv + Pluv) para {}",
-                    activeStations.size(), stateUf);
+                    URI uri = UriComponentsBuilder.fromUriString(baseUrl + "/HidroInventarioEstacoes/v1")
+                            .queryParam("Unidade Federativa", stateUf)
+                            .queryParam("Código da Bacia", "8")
+                            .encode(StandardCharsets.UTF_8)
+                            .build()
+                            .toUri();
 
-            stateInventoryCache.put(
-                    stateUf,
-                    new CachedStateInventory(activeStations, Instant.now().plus(6, ChronoUnit.HOURS))
-            );
+                    long startNanos = System.nanoTime();
+                    var response = restClient.get()
+                            .uri(uri)
+                            .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                            .retrieve()
+                            .body(AnaInventoryResponseDTO.class);
 
-            return activeStations;
-        } catch (Exception e) {
-            log.warn("Failed to fetch ANA station inventory for state {}: {}", stateUf, e.getMessage());
+                    long elapsedMs = Duration.ofNanos(System.nanoTime() - startNanos).toMillis();
+
+                    if (response != null && response.items() != null && !response.items().isEmpty()) {
+                        // Filtra ESTRITAMENTE estações telemétricas ativas (estações manuais dão erro na API de série horária)
+                        List<AnaStationInventoryItemDTO> activeTelemetric = response.items().stream()
+                                .filter(item -> item.stationCode() != null && !item.stationCode().isBlank())
+                                .filter(item -> "1".equals(item.operating()))
+                                .filter(item -> "1".equals(item.isTelemetric()))
+                                .filter(item -> item.telemetricEndDate() == null || item.telemetricEndDate().isBlank())
+                                .filter(item -> parseCoord(item.latitude()) != null && parseCoord(item.longitude()) != null)
+                                .toList();
+
+                        recordSuccess(elapsedMs);
+                        log.info("[ANA Inventory] {} estações telemétricas reais carregadas da ANA para {} ({} ms)",
+                                activeTelemetric.size(), stateUf, elapsedMs);
+
+                        stateInventoryCache.put(
+                                stateUf,
+                                new CachedStateInventory(activeTelemetric, Instant.now().plus(6, ChronoUnit.HOURS))
+                        );
+                        return activeTelemetric;
+                    }
+                } catch (Exception e) {
+                    log.warn("[ANA Inventory] Tentativa {}/2 falhou ao buscar inventário de {}: {}",
+                            attempt, stateUf, e.getMessage());
+                    if (attempt == 1) {
+                        try {
+                            Thread.sleep(1500);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
+            }
+
             return cached != null ? cached.items() : Collections.emptyList();
+        } finally {
+            inventoryLock.unlock();
         }
     }
 
@@ -349,7 +403,7 @@ public class AnaClientService {
 
         String riverName = (item.riverName() != null && !item.riverName().isBlank())
                 ? item.riverName().trim()
-                : (isFluviometric ? "Bacia do " + city.getName() : "Pluviômetro Urbano");
+                : "N/A";
 
         return MonitoringStation.builder()
                 .stationCode(item.stationCode().trim())
@@ -368,10 +422,6 @@ public class AnaClientService {
                 .build();
     }
 
-    /**
-     * Evita que estações instaladas na mesma ponte/barragem (com latitude e longitude idênticas na ANA)
-     * fiquem sobrepostas no mesmo pixel do mapa.
-     */
     private List<MonitoringStation> applyCoordinateDeoverlapping(List<MonitoringStation> stations) {
         for (int i = 0; i < stations.size(); i++) {
             MonitoringStation current = stations.get(i);
@@ -447,16 +497,13 @@ public class AnaClientService {
         );
     }
 
-    /**
-     * Faz um teste ativo real no endpoint /OAUth/v1 da ANA mesmo que já exista token em cache,
-     * garantindo que o status volte para ONLINE assim que a ANA responder.
-     */
     private void probeAnaAuthenticationLive() {
         if (!authLock.tryLock()) {
             return;
         }
         try {
             lastProbeAt = Instant.now();
+            enforceRequestPacing();
             long startNanos = System.nanoTime();
             AnaAuthResponseDTO response = restClient.get()
                     .uri("/OAUth/v1")
@@ -483,12 +530,12 @@ public class AnaClientService {
     }
 
     private void openCircuit(String reason) {
-        this.circuitOpenUntil = Instant.now().plusSeconds(30);
+        this.circuitOpenUntil = Instant.now().plusSeconds(25);
         this.lastProbeAt = Instant.now();
         this.consecutiveFailures.incrementAndGet();
         this.lastKnownAnaStatus = ServiceStatus.OFFLINE;
         this.lastStatusMessage = reason;
-        log.warn("ANA Circuit Breaker OPENED for 30s. Reason: {}", reason);
+        log.warn("ANA Circuit Breaker OPENED for 25s. Reason: {}", reason);
     }
 
     private void recordSuccess(long latencyMs) {
@@ -498,7 +545,7 @@ public class AnaClientService {
         this.lastProbeAt = Instant.now();
         int failuresReset = this.consecutiveFailures.getAndSet(0);
 
-        if (latencyMs > 4500) {
+        if (latencyMs > 8000) {
             this.lastKnownAnaStatus = ServiceStatus.INSTABLE;
             this.lastStatusMessage = "API da ANA respondendo com alta latência (" + latencyMs + " ms).";
         } else {
@@ -513,9 +560,9 @@ public class AnaClientService {
         this.lastProbeAt = Instant.now();
         int failures = this.consecutiveFailures.incrementAndGet();
 
-        if (failures >= 6) {
+        if (failures >= 8) {
             openCircuit(reason);
-        } else if (failures >= 3) {
+        } else if (failures >= 4) {
             this.lastKnownAnaStatus = ServiceStatus.INSTABLE;
             this.lastStatusMessage = "Oscilação em algumas estações da ANA (" + reason + ").";
         }

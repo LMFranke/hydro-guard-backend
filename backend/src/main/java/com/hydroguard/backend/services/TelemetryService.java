@@ -17,8 +17,6 @@ import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -37,20 +35,24 @@ import java.util.concurrent.locks.ReentrantLock;
 @RequiredArgsConstructor
 public class TelemetryService {
 
-    private static final DateTimeFormatter ANA_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final long CACHE_TTL_MINUTES = 10;
-    private static final long PACING_DELAY_MS = 200;
+    private static final long EMPTY_STATION_TTL_MINUTES = 30;
+    private static final int MAX_ACTIVE_FLUVIOMETRIC_PER_CITY = 8;
+    private static final int MAX_ACTIVE_PLUVIOMETRIC_PER_CITY = 4;
 
     private final CityRepository cityRepository;
     private final AnaClientService anaClientService;
 
     private final Map<String, CachedCityTelemetry> telemetryCache = new ConcurrentHashMap<>();
     private final Map<String, List<MonitoringStation>> discoveredStationsCache = new ConcurrentHashMap<>();
+    private final Map<String, CachedStationReading> singleStationCache = new ConcurrentHashMap<>();
+    private final Map<String, Instant> emptyStationCache = new ConcurrentHashMap<>();
     private final Map<String, StationTelemetryDTO> lastValidStationCache = new ConcurrentHashMap<>();
     private final Map<String, ReentrantLock> cityFetchLocks = new ConcurrentHashMap<>();
     private final Set<String> refreshingCities = ConcurrentHashMap.newKeySet();
 
-    private record CachedCityTelemetry(List<StationTelemetryDTO> data, Instant expiresAt, boolean isContingency) {}
+    private record CachedCityTelemetry(List<StationTelemetryDTO> data, Instant expiresAt) {}
+    private record CachedStationReading(StationTelemetryDTO dto, Instant expiresAt) {}
 
     @EventListener(ApplicationReadyEvent.class)
     public void onApplicationReady() {
@@ -64,23 +66,22 @@ public class TelemetryService {
 
     private void syncAllCitiesTelemetryInBackground() {
         List<City> cities = cityRepository.findAll();
-        log.info("[Cache Warmer] Iniciando sincronização em background para {} cidade(s)...", cities.size());
+        log.info("[Cache Warmer] Pré-carregando inventário da ANA e sincronizando {} cidade(s)...", cities.size());
+
+        // Baixa o inventário estadual de SC uma única vez antes de iterar pelas cidades
+        anaClientService.preloadStateInventory("SC");
 
         for (City city : cities) {
             try {
                 List<StationTelemetryDTO> result = refreshCityCacheSync(city.getSlug());
-                log.info("[Cache Warmer] Cidade '{}' pronta em cache ({} estações ativas).",
+                log.info("[Cache Warmer] Cidade '{}' sincronizada com {} estações reais ativas.",
                         city.getSlug(), result.size());
-                Thread.sleep(250);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                return;
             } catch (Exception e) {
                 log.warn("[Cache Warmer] Erro ao sincronizar cidade '{}': {}", city.getSlug(), e.getMessage());
             }
         }
 
-        log.info("[Cache Warmer] Sincronização em background concluída com sucesso.");
+        log.info("[Cache Warmer] Sincronização em background concluída.");
     }
 
     public List<StationTelemetryDTO> getCityTelemetry(String citySlug) {
@@ -88,10 +89,7 @@ public class TelemetryService {
         CachedCityTelemetry cached = telemetryCache.get(normalizedSlug);
 
         if (cached != null && !cached.data().isEmpty()) {
-            boolean shouldRefreshAsync = Instant.now().isAfter(cached.expiresAt())
-                    || (cached.isContingency() && !anaClientService.isCircuitOpen());
-
-            if (shouldRefreshAsync && refreshingCities.add(normalizedSlug)) {
+            if (Instant.now().isAfter(cached.expiresAt()) && refreshingCities.add(normalizedSlug)) {
                 CompletableFuture.runAsync(() -> {
                     try {
                         refreshCityCacheSync(normalizedSlug);
@@ -111,42 +109,51 @@ public class TelemetryService {
         cityLock.lock();
         try {
             CachedCityTelemetry existing = telemetryCache.get(citySlug);
-            if (existing != null && !existing.data().isEmpty()
-                    && Instant.now().isBefore(existing.expiresAt())
-                    && !existing.isContingency()) {
+            if (existing != null && !existing.data().isEmpty() && Instant.now().isBefore(existing.expiresAt())) {
                 return existing.data();
             }
 
-            try {
-                anaClientService.getValidToken();
-            } catch (Exception e) {
-                log.warn("ANA API unreachable during token check for '{}': {}", citySlug, e.getMessage());
-            }
-
-            List<MonitoringStation> candidateStations = resolveStationsForCity(citySlug);
+            List<MonitoringStation> candidateStations = resolveCandidateStationsForCity(citySlug);
             LocalDate today = LocalDate.now();
             List<StationTelemetryDTO> activeData = new ArrayList<>();
+            int activeFluviometric = 0;
+            int activePluviometric = 0;
 
             for (MonitoringStation station : candidateStations) {
-                StationTelemetryDTO dto = buildStationTelemetry(station, today);
-                activeData.add(dto);
+                boolean isFluviometric = "Fluviometrica".equalsIgnoreCase(station.getStationType());
 
-                if (!anaClientService.isCircuitOpen()) {
-                    try {
-                        Thread.sleep(PACING_DELAY_MS);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                        break;
+                if (isFluviometric && activeFluviometric >= MAX_ACTIVE_FLUVIOMETRIC_PER_CITY) {
+                    continue;
+                }
+                if (!isFluviometric && activePluviometric >= MAX_ACTIVE_PLUVIOMETRIC_PER_CITY) {
+                    continue;
+                }
+
+                // Se esta estação já foi testada recentemente por outra cidade e estava sem leituras hoje na ANA, pula em 0ms
+                if (isStationKnownEmpty(station.getStationCode())) {
+                    continue;
+                }
+
+                StationTelemetryDTO dto = fetchRealStationTelemetry(station, today);
+                if (dto != null) {
+                    activeData.add(dto);
+                    if (isFluviometric) {
+                        activeFluviometric++;
+                    } else {
+                        activePluviometric++;
                     }
+                }
+
+                if (activeFluviometric >= MAX_ACTIVE_FLUVIOMETRIC_PER_CITY
+                        && activePluviometric >= MAX_ACTIVE_PLUVIOMETRIC_PER_CITY) {
+                    break;
                 }
             }
 
             if (!activeData.isEmpty()) {
-                boolean isContingency = anaClientService.isCircuitOpen();
-                long ttl = isContingency ? 2 : CACHE_TTL_MINUTES;
                 telemetryCache.put(
                         citySlug,
-                        new CachedCityTelemetry(activeData, Instant.now().plus(ttl, ChronoUnit.MINUTES), isContingency)
+                        new CachedCityTelemetry(activeData, Instant.now().plus(CACHE_TTL_MINUTES, ChronoUnit.MINUTES))
                 );
                 return activeData;
             }
@@ -157,9 +164,9 @@ public class TelemetryService {
         }
     }
 
-    private List<MonitoringStation> resolveStationsForCity(String citySlug) {
+    private List<MonitoringStation> resolveCandidateStationsForCity(String citySlug) {
         List<MonitoringStation> cachedStations = discoveredStationsCache.get(citySlug);
-        if (cachedStations != null && !cachedStations.isEmpty()) {
+        if (cachedStations != null && cachedStations.size() >= 6) {
             return cachedStations;
         }
 
@@ -168,47 +175,70 @@ public class TelemetryService {
         cityRepository.findBySlug(citySlug).ifPresent(city -> {
             if (city.getStations() != null) {
                 for (MonitoringStation s : city.getStations()) {
-                    mergedByCode.put(s.getStationCode(), s);
+                    mergedByCode.put(s.getStationCode().trim(), s);
                 }
             }
 
             List<MonitoringStation> discovered = anaClientService.discoverStationsForCity(city);
             for (MonitoringStation d : discovered) {
-                mergedByCode.putIfAbsent(d.getStationCode(), d);
-            }
-
-            if (mergedByCode.isEmpty()) {
-                String fallbackCode = "SC-" + city.getSlug().toUpperCase();
-                mergedByCode.put(fallbackCode, MonitoringStation.builder()
-                        .stationCode(fallbackCode)
-                        .name("Estação Central - " + city.getName())
-                        .stationType("Fluviometrica")
-                        .riverName("Rio Principal - " + city.getName())
-                        .latitude(city.getMapLat())
-                        .longitude(city.getMapLng())
-                        .thresholdWarning(350.0)
-                        .thresholdAlert(500.0)
-                        .thresholdCritical(650.0)
-                        .city(city)
-                        .build());
+                mergedByCode.putIfAbsent(d.getStationCode().trim(), d);
             }
         });
 
         List<MonitoringStation> result = new ArrayList<>(mergedByCode.values());
-        if (result.stream().anyMatch(s -> !s.getStationCode().startsWith("SC-"))) {
+        // Só fixa no cache se o inventário da ANA respondeu com as candidatas da bacia
+        if (result.size() >= 6) {
             discoveredStationsCache.put(citySlug, result);
         }
 
         return result;
     }
 
-    private StationTelemetryDTO buildStationTelemetry(MonitoringStation station, LocalDate searchDate) {
-        List<AnaTelemetryItemDTO> rawItems = Collections.emptyList();
+    private boolean isStationKnownEmpty(String stationCode) {
+        Instant expiresAt = emptyStationCache.get(stationCode.trim());
+        return expiresAt != null && Instant.now().isBefore(expiresAt);
+    }
 
-        if (!anaClientService.isCircuitOpen()) {
+    /**
+     * Busca exclusivamente dados reais da estação na ANA (ou reaproveita a leitura real
+     * caso uma cidade vizinha já tenha consultado o mesmo sensor nos últimos 10 minutos).
+     * Retorna null se a estação não possuir dados reais transmitidos.
+     */
+    private StationTelemetryDTO fetchRealStationTelemetry(MonitoringStation station, LocalDate searchDate) {
+        String code = station.getStationCode().trim();
+
+        // 1. Reaproveita leitura real já baixada por município vizinho na mesma bacia
+        CachedStationReading shared = singleStationCache.get(code);
+        if (shared != null && Instant.now().isBefore(shared.expiresAt())) {
+            StationTelemetryDTO base = shared.dto();
+            return new StationTelemetryDTO(
+                    code,
+                    station.getName(),
+                    station.getStationType(),
+                    station.getRiverName(),
+                    station.getLatitude(),
+                    station.getLongitude(),
+                    base.currentLevelMeters(),
+                    base.currentFlowM3s(),
+                    base.accumulatedRain24hMm(),
+                    base.status(),
+                    base.thresholdWarning(),
+                    base.thresholdAlert(),
+                    base.thresholdCritical(),
+                    base.lastMeasuredAt(),
+                    base.history()
+            );
+        }
+
+        List<AnaTelemetryItemDTO> rawItems = Collections.emptyList();
+        boolean networkError = false;
+
+        if (anaClientService.isCircuitOpen()) {
+            networkError = true;
+        } else {
             try {
                 AnaTelemetryResponseDTO response = anaClientService.getStationTelemetry(
-                        station.getStationCode(),
+                        code,
                         searchDate,
                         "HORA_24"
                 );
@@ -217,7 +247,8 @@ public class TelemetryService {
                     rawItems = response.items();
                 }
             } catch (Exception e) {
-                log.warn("ANA station {} failed: {}", station.getStationCode(), e.getMessage());
+                networkError = true;
+                log.warn("Falha de rede ao consultar estação {} na ANA: {}", code, e.getMessage());
             }
         }
 
@@ -238,15 +269,19 @@ public class TelemetryService {
         boolean isFluviometric = "Fluviometrica".equalsIgnoreCase(station.getStationType());
         boolean hasValidLevelReading = history.stream().anyMatch(h -> h.levelMeters() != null);
 
+        // Se a estação não retornou dados reais na janela de 24h
         if (history.isEmpty() || (isFluviometric && !hasValidLevelReading)) {
-            StationTelemetryDTO fallback = lastValidStationCache.get(station.getStationCode());
-            if (fallback != null) {
-                return fallback;
+            if (!networkError) {
+                // A ANA respondeu HTTP 200 OK mas esta estação não transmitiu pacotes hoje:
+                // marca como vazia por 30 min para pular direto para a próxima estação real do raio
+                emptyStationCache.put(code, Instant.now().plus(EMPTY_STATION_TTL_MINUTES, ChronoUnit.MINUTES));
             }
-            return buildContingencyStationTelemetry(station);
+            // Se já havia uma leitura real anterior salva em memória antes de uma oscilação de rede, devolve ela;
+            // caso contrário, retorna null (nunca inventa dados artificiais)
+            return lastValidStationCache.get(code);
         }
 
-        TelemetryReadingDTO latest = history.getLast();
+        TelemetryReadingDTO latest = history.get(history.size() - 1);
 
         Double currentLevelMeters = latest.levelMeters();
         if (currentLevelMeters == null && isFluviometric) {
@@ -259,6 +294,15 @@ public class TelemetryService {
         }
 
         Double currentFlowM3s = latest.flowM3s();
+        if (currentFlowM3s == null && isFluviometric) {
+            for (int i = history.size() - 1; i >= 0; i--) {
+                if (history.get(i).flowM3s() != null) {
+                    currentFlowM3s = history.get(i).flowM3s();
+                    break;
+                }
+            }
+        }
+
         String lastMeasuredAt = latest.measuredAt();
 
         double accumulatedRain24h = history.stream()
@@ -271,7 +315,8 @@ public class TelemetryService {
         double alertCm = station.getThresholdAlert();
         double criticalCm = station.getThresholdCritical();
 
-        if (isFluviometric && station.getId() == null && currentLevelMeters != null && currentLevelMeters > 8.0) {
+        // Ajuste de escala para sensores de barragens que reportam cota altimétrica (ex: 19m, 220m, 319m)
+        if (isFluviometric && currentLevelMeters != null && currentLevelMeters > 12.0 && warningCm < 1200.0) {
             double minLevelMeters = history.stream()
                     .map(TelemetryReadingDTO::levelMeters)
                     .filter(Objects::nonNull)
@@ -290,7 +335,7 @@ public class TelemetryService {
         String status = evaluateStatus(metricForStatus, warningCm, alertCm, criticalCm);
 
         StationTelemetryDTO dto = new StationTelemetryDTO(
-                station.getStationCode(),
+                code,
                 station.getName(),
                 station.getStationType(),
                 station.getRiverName(),
@@ -307,66 +352,9 @@ public class TelemetryService {
                 history
         );
 
-        lastValidStationCache.put(station.getStationCode(), dto);
+        lastValidStationCache.put(code, dto);
+        singleStationCache.put(code, new CachedStationReading(dto, Instant.now().plus(CACHE_TTL_MINUTES, ChronoUnit.MINUTES)));
         return dto;
-    }
-
-    /**
-     * Gera série hidrológica base determinística (baseada no hash do código da estação)
-     * para estações reais do inventário que não reportaram pacotes na janela de 24h.
-     */
-    private StationTelemetryDTO buildContingencyStationTelemetry(MonitoringStation station) {
-        boolean isFluviometric = "Fluviometrica".equalsIgnoreCase(station.getStationType());
-        LocalDateTime now = LocalDateTime.now().truncatedTo(ChronoUnit.HOURS);
-
-        int seed = Math.abs(station.getStationCode().hashCode());
-        double ratio = 0.32 + ((seed % 42) / 100.0);
-        double baseLevelMeters = isFluviometric
-                ? Math.round((station.getThresholdWarning() / 100.0) * ratio * 100.0) / 100.0
-                : 0.0;
-
-        double baseFlow = isFluviometric
-                ? Math.round((25.0 + (seed % 140)) * 10.0) / 10.0
-                : 0.0;
-
-        double deltaStepMeters = ((seed % 5) - 2) * 0.01;
-
-        List<TelemetryReadingDTO> history = new ArrayList<>(24);
-        for (int i = 23; i >= 0; i--) {
-            String timestamp = now.minusHours(i).format(ANA_DATE_FORMAT);
-            double waveOffset = Math.sin(i / 4.0) * 0.04;
-            Double hourLevel = isFluviometric
-                    ? Math.max(0.4, Math.round((baseLevelMeters + waveOffset - (i == 0 ? 0 : deltaStepMeters)) * 100.0) / 100.0)
-                    : null;
-
-            history.add(new TelemetryReadingDTO(
-                    timestamp,
-                    hourLevel,
-                    isFluviometric ? baseFlow : null,
-                    0.0
-            ));
-        }
-
-        Double latestLevel = isFluviometric ? history.get(history.size() - 1).levelMeters() : null;
-        String latestTimestamp = now.format(ANA_DATE_FORMAT);
-
-        return new StationTelemetryDTO(
-                station.getStationCode(),
-                station.getName(),
-                station.getStationType(),
-                station.getRiverName(),
-                station.getLatitude(),
-                station.getLongitude(),
-                latestLevel,
-                isFluviometric ? baseFlow : null,
-                0.0,
-                "NORMAL",
-                isFluviometric ? station.getThresholdWarning() / 100.0 : station.getThresholdWarning(),
-                isFluviometric ? station.getThresholdAlert() / 100.0 : station.getThresholdAlert(),
-                isFluviometric ? station.getThresholdCritical() / 100.0 : station.getThresholdCritical(),
-                latestTimestamp,
-                history
-        );
     }
 
     private String evaluateStatus(double value, double warning, double alert, double critical) {
