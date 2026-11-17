@@ -2,13 +2,16 @@ spring:
   devtools:
     restart:
       enabled: false
+
   datasource:
     url: ${DATABASE_URL}
     username: ${DATABASE_USER}
     password: ${DATABASE_PASSWORD}
+
   flyway:
     enabled: true
     baseline-on-migrate: true
+
   jpa:
     open-in-view: false
     hibernate:
@@ -21,7 +24,7 @@ spring:
 api:
   security:
     token:
-      secret: ${JWT_SECRET:hydroguard-dev-secret-key}
+      secret: ${JWT_SECRET}
   ana:
     base-url: https://www.ana.gov.br/hidrowebservice/EstacoesTelemetricas
     identifier: ${ANA_IDENTIFIER}

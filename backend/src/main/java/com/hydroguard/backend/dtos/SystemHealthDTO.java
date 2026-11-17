@@ -8,7 +8,8 @@ public record SystemHealthDTO(
         Long anaLatencyMs,
         Instant checkedAt,
         Instant lastAnaSuccessAt,
-        String message
+        String message,
+        boolean simulatedOutage
 ) {
     public enum ServiceStatus {
         ONLINE,

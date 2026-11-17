@@ -15,8 +15,16 @@ import java.time.ZoneOffset;
 @Service
 public class TokenService {
 
-    @Value("${api.security.token.secret:hydroguard-secret-default}")
-    private String secret;
+    private final String secret;
+
+    public TokenService(@Value("${api.security.token.secret}") String secret) {
+        if (secret == null || secret.isBlank()) {
+            throw new IllegalStateException(
+                    "A variável de ambiente JWT_SECRET é obrigatória e não pode estar vazia."
+            );
+        }
+        this.secret = secret.trim();
+    }
 
     public String generateToken(Coordinator coordinator) {
         try {

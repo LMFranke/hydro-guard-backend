@@ -50,4 +50,5 @@ flyway {
 
 tasks.withType<Test> {
 	useJUnitPlatform()
+	jvmArgs("-XX:+EnableDynamicAgentLoading", "-Xshare:off")
 }

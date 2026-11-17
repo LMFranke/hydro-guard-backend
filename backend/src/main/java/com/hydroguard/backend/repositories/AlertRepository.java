@@ -9,5 +9,6 @@ import java.util.UUID;
 
 @Repository
 public interface AlertRepository extends JpaRepository<Alert, UUID> {
+    List<Alert> findByCitySlugOrderByCreatedAtDesc(String slug);
     List<Alert> findByCitySlugAndActiveTrueOrderByCreatedAtDesc(String slug);
 }
