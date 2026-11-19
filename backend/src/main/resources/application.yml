@@ -29,3 +29,9 @@ api:
     base-url: https://www.ana.gov.br/hidrowebservice/EstacoesTelemetricas
     identifier: ${ANA_IDENTIFIER}
     password: ${ANA_PASSWORD}
+
+  server:
+    compression:
+      enabled: true
+      min-response-size: 1024
+      mime-types: application/json,text/html,text/xml,text/plain,application/javascript,text/css
